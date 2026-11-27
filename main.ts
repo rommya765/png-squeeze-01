@@ -230,6 +230,43 @@ function samplesOf(rgba, colourType) {
 // ---------------------------------------------------------------------------
 function paletteForm(rgba, colours, order) {
   const lum = (c) => 299 * c.r + 587 * c.g + 114 * c.b;
+  if (order === 'path') {
+    // Greedy nearest-neighbour path through colour space, non-opaque
+    // entries first (tRNS stays short): spatially adjacent colours in the
+    // screenshot tend to be adjacent palette entries too, so Sub-filter
+    // residuals of the index rows stay small and runs stay long.
+    const dist2 = (a, b) => {
+      const dr = a.r - b.r;
+      const dg = a.g - b.g;
+      const db = a.b - b.b;
+      return dr * dr + dg * dg + db * db;
+    };
+    const pathOf = (group) => {
+      const rest = [...group];
+      if (rest.length === 0) return rest;
+      let start = 0;
+      for (let i = 1; i < rest.length; i++) if (rest[i].count > rest[start].count) start = i;
+      const out = [rest.splice(start, 1)[0]];
+      while (rest.length > 0) {
+        const last = out[out.length - 1];
+        let bestI = 0;
+        let bestD = Infinity;
+        for (let i = 0; i < rest.length; i++) {
+          const d = dist2(last, rest[i]);
+          if (d < bestD) {
+            bestD = d;
+            bestI = i;
+          }
+        }
+        out.push(rest.splice(bestI, 1)[0]);
+      }
+      return out;
+    };
+    const transparent = colours.filter((c) => c.a !== 255).sort((a, b) => a.a - b.a || b.count - a.count);
+    const opaque = colours.filter((c) => c.a === 255);
+    const entries = [...pathOf(transparent), ...pathOf(opaque)];
+    return paletteFromEntries(rgba, entries);
+  }
   const entries = [...colours].sort((x, y) => {
     if (order === 'freq') return y.count - x.count || lum(x) - lum(y);
     if (order === 'lum') return lum(x) - lum(y) || y.count - x.count;
@@ -240,6 +277,11 @@ function paletteForm(rgba, colours, order) {
     if (xa === 0 && x.a !== y.a) return x.a - y.a;
     return y.count - x.count || lum(x) - lum(y);
   });
+  return paletteFromEntries(rgba, entries);
+}
+
+// Build the palette form (PLTE, tRNS, index rows) from an entry order.
+function paletteFromEntries(rgba, entries) {
   const indexOf = new Map();
   entries.forEach((c, i) => indexOf.set((c.r << 24) | (c.g << 16) | (c.b << 8) | c.a, i));
   const plte = new Uint8Array(entries.length * 3);
@@ -384,6 +426,39 @@ function filteredVariants(samples, width, height, bpp, strategies) {
     }
   }
   return out;
+}
+
+// Brute-force filtered stream for one form: every row's filter is the one
+// whose trial row deflates smallest against the stream built so far (the
+// preceding bytes as dictionary), which prices in the matches a row can
+// reuse from its neighbours — the choice the cheap cost models only guess.
+// Only narrow forms (palette, grey, grey+alpha) pay for this: their rows
+// are short, so the thousands of small deflate trials stay affordable.
+function bruteFiltered(samples, width, height, bpp) {
+  const stride = width * bpp;
+  const rowBytes = stride + 1;
+  const raw = new Uint8Array(height * rowBytes);
+  const trial = new Uint8Array(rowBytes);
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * rowBytes;
+    const before = raw.subarray(Math.max(0, at - 4096), at);
+    let bestType = 0;
+    let bestSize = Infinity;
+    for (let t = 0; t < 5; t++) {
+      trial[0] = t;
+      filterRow(t, cur, prev, bpp, trial.subarray(1));
+      const size = deflateSync(trial, before.length === 0 ? { level: 4, memLevel: 9 } : { level: 4, memLevel: 9, dictionary: Buffer.from(before) }).length;
+      if (size < bestSize) {
+        bestSize = size;
+        bestType = t;
+      }
+    }
+    raw[at] = bestType;
+    filterRow(bestType, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
+  }
+  return raw;
 }
 
 // ---------------------------------------------------------------------------
@@ -543,15 +618,19 @@ function canonicalCodes(lengths) {
   return codes;
 }
 
-// Longest-match pre-pass: for every position, the longest match (length and
-// distance) and the nearest match of length >= 3, found by walking hash
-// chains newest-first. Chain effort is a fixed budget per position.
+// Longest-match pre-pass: for every position, walk the hash chain of its
+// 3-byte prefix newest-first and record the Pareto frontier of (length,
+// distance): candidates arrive in distance-ascending order, so the
+// frontier is exactly the record-breaking lengths of the walk — for every
+// match length, the cheapest distance that reaches it (the same submatch
+// information zopfli's cache keeps). Packed as (dist << 9) | len in a
+// pooled array with per-position offsets.
 function findMatches(data, chainLimit) {
   const n = data.length;
   const lens = new Uint16Array(n);
   const dists = new Uint32Array(n);
-  const lens2 = new Uint16Array(n);
-  const dists2 = new Uint32Array(n);
+  const offs = new Uint32Array(n + 1);
+  const pool = [];
   const HASH_BITS = 15;
   const head = new Int32Array(1 << HASH_BITS).fill(-1);
   const prev = new Int32Array(n).fill(-1);
@@ -568,13 +647,15 @@ function findMatches(data, chainLimit) {
     const idx = p >> 2;
     return o === 0 ? words[idx] : (words[idx] >>> (o << 3)) | (words[idx + 1] << (32 - (o << 3)));
   };
+  const fLen = new Int32Array(16);
+  const fDist = new Int32Array(16);
   for (let i = 0; i < n; i++) {
+    offs[i] = pool.length;
     if (i + 2 < n) {
       let cand = head[hashOf(i)];
       let bestLen = 0;
       let bestDist = 0;
-      let nearLen = 0;
-      let nearDist = 0;
+      let m = 0;
       let steps = chainLimit;
       const maxLen = Math.min(258, n - i);
       while (cand >= 0 && steps-- > 0) {
@@ -585,20 +666,20 @@ function findMatches(data, chainLimit) {
           let l = 0;
           while (l + 4 <= maxLen && wordAt(cand + l) === wordAt(i + l)) l += 4;
           while (l < maxLen && data[cand + l] === data[i + l]) l++;
-          if (l >= 3) {
-            if (nearLen === 0) {
-              nearLen = l;
-              nearDist = dist;
+          if (l > bestLen) {
+            bestLen = l;
+            bestDist = dist;
+            if (m < 16) {
+              fLen[m] = l;
+              fDist[m] = dist;
+              m++;
             }
-            if (l > bestLen || (l === bestLen && dist < bestDist)) {
-              bestLen = l;
-              bestDist = dist;
-              if (l >= maxLen) break;
-              // A long match is nearly as good as the longest: stop walking
-              // the chain soon after finding one.
-              if (bestLen >= 96) break;
-              if (bestLen >= 32 && steps > 6) steps = 6;
-            }
+            if (l >= maxLen) break;
+            // A long match is nearly as good as the longest: stop walking
+            // the chain soon after finding one (measured: relaxing the old
+            // tight cutoffs was worth several percent on rich/alpha data).
+            if (bestLen >= 96) break;
+            if (bestLen >= 32 && steps > 64) steps = 64;
           }
         }
         cand = prev[cand];
@@ -606,15 +687,15 @@ function findMatches(data, chainLimit) {
       if (bestLen >= 3) {
         lens[i] = bestLen;
         dists[i] = bestDist;
-        lens2[i] = nearLen;
-        dists2[i] = nearDist;
+        for (let k = 0; k < m; k++) pool.push((fDist[k] << 9) | fLen[k]);
       }
       const h = hashOf(i);
       prev[i] = head[h];
       head[h] = i;
     }
   }
-  return { lens, dists, lens2, dists2 };
+  offs[n] = pool.length;
+  return { lens, dists, offs, pool: Uint32Array.from(pool) };
 }
 
 // Lazy parse driven by the precomputed matches.
@@ -667,11 +748,12 @@ function parseFreqs(tokens) {
   return { litFreq, distFreq };
 }
 
-// Cost-optimal parse: backward dynamic programming with the bit costs of the
-// previous parse's Huffman tables. Match lengths are tried exhaustively up to
-// 34 and at length-code boundaries above that, for both recorded distances.
-function optimalParse(data, matches, litLens, distLens) {
-  const n = data.length;
+// Cost-optimal parse of the data range [start, end): backward dynamic
+// programming with the bit costs of the previous parse's Huffman tables.
+// Match lengths are tried exhaustively up to 34 and at length-code
+// boundaries above that, for every recorded distance option.
+function optimalParse(data, matches, litLens, distLens, start = 0, end = data.length) {
+  const n = end;
   const litCost = new Float64Array(286);
   for (let s = 0; s < 286; s++) litCost[s] = litLens[s] > 0 ? litLens[s] : 64;
   const lenCost = new Float64Array(259);
@@ -688,45 +770,54 @@ function optimalParse(data, matches, litLens, distLens) {
   const dp = new Float64Array(n + 1);
   const choiceLen = new Uint16Array(n);
   const choiceDist = new Uint32Array(n);
-  for (let i = n - 1; i >= 0; i--) {
+  for (let i = n - 1; i >= start; i--) {
     let best = dp[i + 1] + litCost[data[i]];
     let bestL = 0;
     let bestD = 0;
-    for (let opt = 0; opt < 2; opt++) {
-      const maxL = opt === 0 ? matches.lens[i] : matches.lens2[i];
-      if (maxL < 3) continue;
-      const dist = opt === 0 ? matches.dists[i] : matches.dists2[i];
-      if (opt === 1 && dist === matches.dists[i]) continue;
-      const dc = distCostCache[dist];
-      const lim = Math.min(maxL, n - i);
-      // A position that already matches far ahead rarely wins with a short
-      // match: skip the exhaustive small lengths there.
-      const small = Math.min(lim, lim >= 48 ? 10 : 34);
-      for (let l = 3; l <= small; l++) {
-        const c = dp[i + l] + lenCost[l] + dc;
-        if (c < best) {
-          best = c;
-          bestL = l;
-          bestD = dist;
-        }
-      }
-      for (const l of BOUNDARY) {
-        if (l > small && l <= lim) {
+    // Frontier bands: entry k covers lengths (prevLen, len_k] at its dist —
+    // for each band, try lengths exhaustively to 34, at length-code
+    // boundaries above that, and at the band's own achieved length.
+    const o0 = matches.offs[i];
+    const o1 = matches.offs[i + 1];
+    if (o1 > o0) {
+      const lim = Math.min(matches.lens[i], n - i);
+      let prevLen = 2;
+      for (let k = o0; k < o1; k++) {
+        const packed = matches.pool[k];
+        const fl = packed & 511;
+        const fd = packed >>> 9;
+        const dc = distCostCache[fd];
+        const hi = Math.min(fl, lim);
+        const lo = Math.max(3, prevLen + 1);
+        const small = Math.min(hi, 34);
+        for (let l = lo; l <= small; l++) {
           const c = dp[i + l] + lenCost[l] + dc;
           if (c < best) {
             best = c;
             bestL = l;
-            bestD = dist;
+            bestD = fd;
           }
         }
-      }
-      if (lim > 34 && !BOUNDARY.includes(lim)) {
-        const c = dp[i + lim] + lenCost[lim] + dc;
-        if (c < best) {
-          best = c;
-          bestL = lim;
-          bestD = dist;
+        for (const l of BOUNDARY) {
+          if (l >= lo && l > 34 && l <= hi) {
+            const c = dp[i + l] + lenCost[l] + dc;
+            if (c < best) {
+              best = c;
+              bestL = l;
+              bestD = fd;
+            }
+          }
         }
+        if (hi > 34 && !BOUNDARY.includes(hi)) {
+          const c = dp[i + hi] + lenCost[hi] + dc;
+          if (c < best) {
+            best = c;
+            bestL = hi;
+            bestD = fd;
+          }
+        }
+        prevLen = fl;
+        if (fl >= lim) break;
       }
     }
     dp[i] = best;
@@ -736,7 +827,7 @@ function optimalParse(data, matches, litLens, distLens) {
   const types = [];
   const vals = [];
   const dsts = [];
-  let i = 0;
+  let i = start;
   while (i < n) {
     const l = choiceLen[i];
     if (l >= 3) {
@@ -939,30 +1030,50 @@ function adler32(data) {
 // whole set stays inside its wall on one CPU.
 function squeeze(data) {
   const n = data.length;
-  const chain = n <= 400000 ? 256 : n <= 1500000 ? 96 : 48;
+  const chain = n <= 400000 ? 512 : n <= 1500000 ? 768 : 384;
   const iterations = n <= 400000 ? 3 : 2;
-  const blockSpan = n <= 400000 ? 131072 : 262144;
   const matches = findMatches(data, chain);
   let tokens = lazyParse(data, matches);
+  // (A per-block re-parse with per-block Huffman statistics was tried and
+  // measured worse on the practice set; the global-statistics parse below
+  // stays.)
   for (let it = 0; it < iterations; it++) {
     const { litFreq, distFreq } = parseFreqs(tokens);
-    const litLens = huffmanLengths(litFreq, 15);
-    const distLens = huffmanLengths(distFreq, 15);
+    // The parse is priced with entropy costs (-log2 of the previous
+    // parse's symbol frequencies), not with the previous parse's integer
+    // Huffman lengths: fractional bit costs track the true price of a
+    // token far better, measured on rich and alpha data. The Huffman
+    // lengths themselves are only needed again at emission time.
+    const litTotal = litFreq.reduce((a, b) => a + b, 0);
+    const distTotal = distFreq.reduce((a, b) => a + b, 0);
+    const litLens = Float64Array.from(litFreq, (f) => -Math.log2(Math.max(f, 1) / litTotal));
+    const distLens = Float64Array.from(distFreq, (f) => -Math.log2(Math.max(f, 1) / distTotal));
     tokens = optimalParse(data, matches, litLens, distLens);
   }
-  // Split the token stream into blocks by covered data span.
-  const spans = [];
-  let start = 0;
-  let covered = 0;
-  for (let t = 0; t < tokens.types.length; t++) {
-    covered += tokens.types[t] === 0 ? 1 : tokens.vals[t];
-    if (covered >= blockSpan && t + 1 < tokens.types.length) {
-      spans.push([start, t + 1]);
-      start = t + 1;
-      covered = 0;
+  // Split the token stream into blocks where the split pays: recursively
+  // try 23 evenly spaced split points per range and keep the best when it
+  // saves more than 150 bits by exact block cost (each block re-derives
+  // its Huffman tables, so splits track the image's changing statistics —
+  // the fixed data-span blocks this replaces left real bytes behind).
+  const bitsOf = (from, to) => planBlock(tokens, from, to).bits;
+  const splitRec = (from, to, depth) => {
+    if (depth === 0 || to - from < 3000) return [[from, to]];
+    const whole = bitsOf(from, to);
+    let bestGain = 150;
+    let bestAt = -1;
+    for (let k = 1; k < 24; k++) {
+      const at = from + Math.floor(((to - from) * k) / 24);
+      if (at <= from || at >= to) continue;
+      const gain = whole - bitsOf(from, at) - bitsOf(at, to);
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestAt = at;
+      }
     }
-  }
-  spans.push([start, tokens.types.length]);
+    if (bestAt < 0) return [[from, to]];
+    return [...splitRec(from, bestAt, depth - 1), ...splitRec(bestAt, to, depth - 1)];
+  };
+  const spans = splitRec(0, tokens.types.length, 3);
   const w = new BitWriter();
   spans.forEach(([from, to], idx) => {
     planBlock(tokens, from, to).write(w, idx === spans.length - 1);
@@ -998,6 +1109,11 @@ function extraBytes(form) {
 function compressImage(width, height, rgba) {
   const info = analyse(rgba);
   const forms = formsOf(rgba, info);
+  // Full screening of every dataset. (Two shortcuts were tried and
+  // reverted on generated-set validation: trimming the wide forms'
+  // strategy list — the 'pairs' dataset feeds the winning squeeze on
+  // alpha/rich images — and prefix-only pre-screening, which mis-ranked
+  // datasets whose advantage only appears in later rows.)
   const screened = [];
   for (const form of forms) {
     const strategies = form.colourType === 3 ? [0, 'minsum', 'pairs'] : [0, 1, 2, 4, 'minsum', 'pairs'];
@@ -1010,7 +1126,7 @@ function compressImage(width, height, rgba) {
   }
   screened.sort((a, b) => a.size - b.size);
   let best = null;
-  const leaders = screened.slice(0, 3);
+  const leaders = screened.slice(0, 2);
   leaders.forEach((cand, idx) => {
     const optsList = idx === 0 ? FINAL_OPTS_LIST : [FINAL_OPTS_LIST[1]];
     for (const opts of optsList) {
@@ -1019,9 +1135,25 @@ function compressImage(width, height, rgba) {
       if (best === null || file.length < best.length) best = file;
     }
   });
-  // Our own deflate on the leading dataset (and the runner-up when it is
-  // small), kept only when it inflates back to the exact bytes given.
-  const squeezePool = screened.slice(0, screened[1] && screened[1].data.length <= 600000 ? 2 : 1);
+  // A brute-force-filtered stream for a narrow leading form joins the
+  // pool: its rows were chosen by real deflate trials, not a cost model.
+  const leadForm = screened[0].form;
+  let bruteData = null;
+  let bruteFile = null;
+  if (leadForm.bpp <= 2) {
+    bruteData = bruteFiltered(leadForm.samples, width, height, leadForm.bpp);
+    bruteFile = pngFile(width, height, leadForm, deflateSync(bruteData, FINAL_OPTS_LIST[1]));
+    if (bruteFile.length < best.length) best = bruteFile;
+  }
+  // Our own deflate: both datasets when they are small (the zlib ranking
+  // is an imperfect proxy for the squeezed ranking), otherwise only the
+  // zlib winner. A stream is kept only when it inflates back to the exact
+  // bytes it was given.
+  const squeezePool = [screened[0]];
+  if (bruteData !== null) {
+    if (bruteData.length <= 950000) squeezePool.push({ form: leadForm, data: bruteData });
+    else if (bruteFile.length < best.length) squeezePool[0] = { form: leadForm, data: bruteData };
+  }
   for (const cand of squeezePool) {
     try {
       const zipped = squeeze(cand.data);
