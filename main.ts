@@ -630,7 +630,8 @@ function findMatches(data, chainLimit) {
   const lens = new Uint16Array(n);
   const dists = new Uint32Array(n);
   const offs = new Uint32Array(n + 1);
-  const pool = [];
+  let poolArr = new Uint32Array(1 << 22);
+  let poolLen = 0;
   const HASH_BITS = 15;
   const head = new Int32Array(1 << HASH_BITS).fill(-1);
   const prev = new Int32Array(n).fill(-1);
@@ -650,7 +651,7 @@ function findMatches(data, chainLimit) {
   const fLen = new Int32Array(16);
   const fDist = new Int32Array(16);
   for (let i = 0; i < n; i++) {
-    offs[i] = pool.length;
+    offs[i] = poolLen;
     if (i + 2 < n) {
       let cand = head[hashOf(i)];
       let bestLen = 0;
@@ -687,15 +688,20 @@ function findMatches(data, chainLimit) {
       if (bestLen >= 3) {
         lens[i] = bestLen;
         dists[i] = bestDist;
-        for (let k = 0; k < m; k++) pool.push((fDist[k] << 9) | fLen[k]);
+        if (poolLen + m > poolArr.length) {
+          const bigger = new Uint32Array(poolArr.length * 2);
+          bigger.set(poolArr);
+          poolArr = bigger;
+        }
+        for (let k = 0; k < m; k++) poolArr[poolLen++] = (fDist[k] << 9) | fLen[k];
       }
       const h = hashOf(i);
       prev[i] = head[h];
       head[h] = i;
     }
   }
-  offs[n] = pool.length;
-  return { lens, dists, offs, pool: Uint32Array.from(pool) };
+  offs[n] = poolLen;
+  return { lens, dists, offs, pool: poolArr.subarray(0, poolLen) };
 }
 
 // Lazy parse driven by the precomputed matches.
@@ -1030,8 +1036,8 @@ function adler32(data) {
 // whole set stays inside its wall on one CPU.
 function squeeze(data) {
   const n = data.length;
-  const chain = n <= 400000 ? 512 : n <= 1500000 ? 768 : 384;
-  const iterations = n <= 400000 ? 3 : 2;
+  const chain = n <= 400000 ? 384 : n <= 1500000 ? 512 : 128;
+  const iterations = n > 1500000 ? 1 : 2;
   const matches = findMatches(data, chain);
   let tokens = lazyParse(data, matches);
   // (A per-block re-parse with per-block Huffman statistics was tried and
