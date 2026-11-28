@@ -443,13 +443,13 @@ function bruteFiltered(samples, width, height, bpp) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
     const at = y * rowBytes;
-    const before = raw.subarray(Math.max(0, at - 4096), at);
+    const before = raw.subarray(Math.max(0, at - 16384), at);
     let bestType = 0;
     let bestSize = Infinity;
     for (let t = 0; t < 5; t++) {
       trial[0] = t;
       filterRow(t, cur, prev, bpp, trial.subarray(1));
-      const size = deflateSync(trial, before.length === 0 ? { level: 4, memLevel: 9 } : { level: 4, memLevel: 9, dictionary: Buffer.from(before) }).length;
+      const size = deflateSync(trial, before.length === 0 ? { level: 5, memLevel: 9 } : { level: 5, memLevel: 9, dictionary: Buffer.from(before) }).length;
       if (size < bestSize) {
         bestSize = size;
         bestType = t;
@@ -457,6 +457,55 @@ function bruteFiltered(samples, width, height, bpp) {
     }
     raw[at] = bestType;
     filterRow(bestType, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
+  }
+  return raw;
+}
+
+function viterbiFiltered(samples, width, height, bpp) {
+  const stride = width * bpp;
+  const rowBytes = stride + 1;
+  const raw = new Uint8Array(height * rowBytes);
+  const rowOpts = [];
+  for (let t = 0; t < 5; t++) rowOpts.push(new Uint8Array(rowBytes));
+  let dpPrev = [0, 0, 0, 0, 0];
+  const backpointers = new Int8Array(height * 5);
+  const chosen = new Int8Array(height);
+  let prevRows = null; // filtered variants of the previous row, by type
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    for (let t = 0; t < 5; t++) {
+      rowOpts[t][0] = t;
+      filterRow(t, cur, prev, bpp, rowOpts[t].subarray(1));
+    }
+    const dpCur = [Infinity, Infinity, Infinity, Infinity, Infinity];
+    for (let cf = 0; cf < 5; cf++) {
+      for (let pf = 0; pf < 5; pf++) {
+        if (y === 0 && pf !== 0) continue;
+        const dict = y === 0 ? null : prevRows[pf];
+        const size = deflateSync(rowOpts[cf], dict === null ? { level: 4, memLevel: 9 } : { level: 4, memLevel: 9, dictionary: Buffer.from(dict) }).length;
+        const c = dpPrev[pf] + size;
+        if (c < dpCur[cf]) {
+          dpCur[cf] = c;
+          backpointers[y * 5 + cf] = pf;
+        }
+      }
+    }
+    dpPrev = dpCur;
+    prevRows = rowOpts.map((r) => r.slice());
+  }
+  let bestT = 0;
+  for (let t = 1; t < 5; t++) if (dpPrev[t] < dpPrev[bestT]) bestT = t;
+  for (let y = height - 1; y >= 0; y--) {
+    chosen[y] = bestT;
+    bestT = backpointers[y * 5 + bestT];
+  }
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * rowBytes;
+    raw[at] = chosen[y];
+    filterRow(chosen[y], cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
   }
   return raw;
 }
@@ -632,7 +681,7 @@ function findMatches(data, chainLimit) {
   const offs = new Uint32Array(n + 1);
   let poolArr = new Uint32Array(1 << 22);
   let poolLen = 0;
-  const HASH_BITS = 15;
+  const HASH_BITS = 16;
   const head = new Int32Array(1 << HASH_BITS).fill(-1);
   const prev = new Int32Array(n).fill(-1);
   const hashOf = (i) => ((data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2]) * 0x9e3779b1 >>> (32 - HASH_BITS);
@@ -772,7 +821,7 @@ function optimalParse(data, matches, litLens, distLens, start = 0, end = data.le
     const s = DIST_SYMBOL[d];
     distCostCache[d] = (distLens[s] > 0 ? distLens[s] : 64) + DIST_EXTRA[s];
   }
-  const BOUNDARY = [35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+  const BOUNDARY = [42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226, 257, 258];
   const dp = new Float64Array(n + 1);
   const choiceLen = new Uint16Array(n);
   const choiceDist = new Uint32Array(n);
@@ -1037,7 +1086,7 @@ function adler32(data) {
 function squeeze(data) {
   const n = data.length;
   const chain = n <= 400000 ? 384 : n <= 1500000 ? 512 : 128;
-  const iterations = n > 1500000 ? 1 : 2;
+  const iterations = n > 3000000 ? 1 : 2;
   const matches = findMatches(data, chain);
   let tokens = lazyParse(data, matches);
   // (A per-block re-parse with per-block Huffman statistics was tried and
@@ -1063,12 +1112,12 @@ function squeeze(data) {
   // the fixed data-span blocks this replaces left real bytes behind).
   const bitsOf = (from, to) => planBlock(tokens, from, to).bits;
   const splitRec = (from, to, depth) => {
-    if (depth === 0 || to - from < 3000) return [[from, to]];
+    if (depth === 0 || to - from < 2500) return [[from, to]];
     const whole = bitsOf(from, to);
-    let bestGain = 150;
+    let bestGain = 100;
     let bestAt = -1;
-    for (let k = 1; k < 24; k++) {
-      const at = from + Math.floor(((to - from) * k) / 24);
+    for (let k = 1; k < 28; k++) {
+      const at = from + Math.floor(((to - from) * k) / 28);
       if (at <= from || at >= to) continue;
       const gain = whole - bitsOf(from, at) - bitsOf(at, to);
       if (gain > bestGain) {
@@ -1132,7 +1181,7 @@ function compressImage(width, height, rgba) {
   }
   screened.sort((a, b) => a.size - b.size);
   let best = null;
-  const leaders = screened.slice(0, 2);
+  const leaders = screened[0].data.length > 1500000 ? [] : screened.slice(0, 2);
   leaders.forEach((cand, idx) => {
     const optsList = idx === 0 ? FINAL_OPTS_LIST : [FINAL_OPTS_LIST[1]];
     for (const opts of optsList) {
@@ -1149,16 +1198,31 @@ function compressImage(width, height, rgba) {
   if (leadForm.bpp <= 2) {
     bruteData = bruteFiltered(leadForm.samples, width, height, leadForm.bpp);
     bruteFile = pngFile(width, height, leadForm, deflateSync(bruteData, FINAL_OPTS_LIST[1]));
-    if (bruteFile.length < best.length) best = bruteFile;
+    if (best === null || bruteFile.length < best.length) best = bruteFile;
+  }
+  // A viterbi-filtered stream for a palette leading form joins the
+  // extras: its per-row filters come from a DP over (previous, current)
+  // filter states priced by real deflate trials.
+  let vitData = null;
+  let vitFile = null;
+  if (leadForm.colourType === 3) {
+    vitData = viterbiFiltered(leadForm.samples, width, height, leadForm.bpp);
+    vitFile = pngFile(width, height, leadForm, deflateSync(vitData, FINAL_OPTS_LIST[1]));
+    if (best === null || vitFile.length < best.length) best = vitFile;
   }
   // Our own deflate: both datasets when they are small (the zlib ranking
   // is an imperfect proxy for the squeezed ranking), otherwise only the
   // zlib winner. A stream is kept only when it inflates back to the exact
   // bytes it was given.
   const squeezePool = [screened[0]];
-  if (bruteData !== null) {
-    if (bruteData.length <= 950000) squeezePool.push({ form: leadForm, data: bruteData });
-    else if (bruteFile.length < best.length) squeezePool[0] = { form: leadForm, data: bruteData };
+  const extras = [];
+  if (bruteData !== null) extras.push({ data: bruteData, file: bruteFile });
+  if (vitData !== null) extras.push({ data: vitData, file: vitFile });
+  extras.sort((a, b) => a.file.length - b.file.length);
+  if (extras.length > 0) {
+    const top = extras[0];
+    if (top.data.length <= 950000) squeezePool.push({ form: leadForm, data: top.data });
+    else if (best === null || top.file.length < best.length) squeezePool[0] = { form: leadForm, data: top.data };
   }
   for (const cand of squeezePool) {
     try {
@@ -1166,7 +1230,7 @@ function compressImage(width, height, rgba) {
       const back = inflateSync(zipped);
       if (back.length === cand.data.length && Buffer.from(cand.data).equals(back)) {
         const file = pngFile(width, height, cand.form, zipped);
-        if (file.length < best.length) best = file;
+        if (best === null || file.length < best.length) best = file;
       }
     } catch {
       // A failed experiment must never lose the zlib result already in hand.
